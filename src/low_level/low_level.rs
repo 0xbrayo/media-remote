@@ -1,7 +1,7 @@
 use block2::RcBlock;
 use core::ffi::c_int;
-use dispatch2::ffi::{dispatch_queue_create, DISPATCH_QUEUE_SERIAL};
-use objc2::{runtime::AnyObject, Encoding};
+use dispatch2::ffi::{dispatch_queue_create, dispatch_release, DISPATCH_QUEUE_SERIAL};
+use objc2::{rc::autoreleasepool, runtime::AnyObject, Encoding};
 use objc2_core_foundation::{CFData, CFDate, CFDictionary};
 use objc2_foundation::{NSNumber, NSString};
 use std::{
@@ -24,40 +24,54 @@ macro_rules! safely_dispatch_and_wait {
 
         let result_clone = Arc::clone(&result);
         let block = RcBlock::new(move |arg: $type| {
-            let (lock, cvar) = &*result_clone;
-            let mut result_guard = lock.lock().unwrap();
+            // Drain autoreleased framework objects (e.g. multi-MB artwork data)
+            // as soon as the callback returns, instead of letting them pile up
+            // in the notification-delivery thread's pool during a song-switch burst.
+            autoreleasepool(|_| {
+                let (lock, cvar) = &*result_clone;
+                let mut result_guard = lock.lock().unwrap();
 
-            *result_guard = $closure(arg);
+                *result_guard = $closure(arg);
 
-            cvar.notify_one();
+                cvar.notify_one();
+            });
         });
 
-        unsafe {
-            let queue = dispatch_queue_create(ptr::null(), DISPATCH_QUEUE_SERIAL);
-            if queue.is_null() {
-                return None;
-            }
+        let queue = unsafe { dispatch_queue_create(ptr::null(), DISPATCH_QUEUE_SERIAL) };
+        if queue.is_null() {
+            return None;
+        }
 
+        unsafe {
             $func(queue, &block);
         }
 
         let (lock, cvar) = &*result;
-        let result_guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => return None,
-        };
+        let result = (|| {
+            let result_guard = match lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
 
-        let (result_guard, timeout_result) = match cvar.wait_timeout(result_guard, TIMEOUT_DURATION)
-        {
-            Ok(res) => res,
-            Err(_) => return None,
-        };
+            let (result_guard, timeout_result) =
+                match cvar.wait_timeout(result_guard, TIMEOUT_DURATION) {
+                    Ok(res) => res,
+                    Err(_) => return None,
+                };
 
-        if timeout_result.timed_out() {
-            None
-        } else {
-            result_guard.clone()
-        }
+            if timeout_result.timed_out() {
+                None
+            } else {
+                result_guard.clone()
+            }
+        })();
+
+        // Balance the +1 reference returned by `dispatch_queue_create`. The block
+        // has finished running by the time we wake from the condvar, so the queue
+        // is idle and safe to release.
+        unsafe { dispatch_release(queue.cast()) };
+
+        result
     }};
 }
 
