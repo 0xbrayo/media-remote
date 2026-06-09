@@ -37,8 +37,21 @@ use crate::{register_for_now_playing_notifications, BundleInfo, Notification, Ob
 ///     }
 /// }
 /// ```
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+static BUNDLE_CACHE: OnceLock<Mutex<HashMap<String, BundleInfo>>> = OnceLock::new();
+
 pub fn get_bundle_info(id: &str) -> Option<BundleInfo> {
-    autoreleasepool(|_| {
+    let cache = BUNDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(info) = guard.get(id) {
+            return Some(info.clone());
+        }
+    }
+
+    let info = autoreleasepool(|_| {
         let workspace = NSWorkspace::sharedWorkspace();
         let url = workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(id))?;
 
@@ -62,7 +75,11 @@ pub fn get_bundle_info(id: &str) -> Option<BundleInfo> {
             name: name.to_string(),
             icon,
         })
-    })
+    })?;
+
+    let mut guard = cache.lock().unwrap();
+    guard.insert(id.to_string(), info.clone());
+    Some(info)
 }
 
 /// Adds an observer for a specific media notification.
